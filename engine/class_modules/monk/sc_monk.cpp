@@ -1230,12 +1230,6 @@ struct tiger_palm_t : public monk_melee_attack_t
 
         auto brew_cdr = p()->spec.tiger_palm->effectN( 3 ).base_value();
 
-        if ( p()->buff.flames_of_primordium->check() )
-        {
-          brew_cdr *= 1 + p()->sets->set( MONK_BREWMASTER, T28, B4 )->effectN( 1 ).percent();
-          p()->buff.flames_of_primordium->expire();
-        }
-
         // Reduces the remaining cooldown on your Brews by 1 sec
         brew_cooldown_reduction( brew_cdr );
 
@@ -1621,12 +1615,6 @@ struct blackout_kick_t : public monk_melee_attack_t
           p()->buff.blackout_combo->trigger();
 
         auto shuffle_duration = p()->spec.blackout_kick_brm->effectN( 2 ).base_value();
-
-        if ( p()->buff.flames_of_primordium->check() )
-        {
-          shuffle_duration *= 1 + p()->sets->set( MONK_BREWMASTER, T28, B4 )->effectN( 1 ).percent();
-          p()->buff.flames_of_primordium->expire();
-        }
 
         trigger_shuffle( shuffle_duration );
         break;
@@ -2471,9 +2459,19 @@ struct auto_attack_t : public monk_melee_attack_t
 // ==========================================================================
 // Keg Smash
 // ==========================================================================
+struct keg_of_the_heavens_heal_t : public monk_heal_t
+{
+  keg_of_the_heavens_heal_t( monk_t& p ) : monk_heal_t( "keg_of_the_heavens_heal", p, p.passives.keg_of_the_heavens_heal )
+  {
+    background = true;
+  }
+};
+
 struct keg_smash_t : public monk_melee_attack_t
 {
-  keg_smash_t( monk_t& p, util::string_view options_str ) : monk_melee_attack_t( "keg_smash", &p, p.spec.keg_smash )
+  keg_of_the_heavens_heal_t* heal;
+  keg_smash_t( monk_t& p, util::string_view options_str ) : monk_melee_attack_t( "keg_smash", &p, p.spec.keg_smash ), 
+      heal( new keg_of_the_heavens_heal_t( p ) )
   {
     parse_options( options_str );
 
@@ -2513,6 +2511,9 @@ struct keg_smash_t : public monk_melee_attack_t
       }
     }
 
+    if ( p()->sets->has_set_bonus( MONK_BREWMASTER, T28, B4 ) )
+      am *= 1 + p()->sets->set( MONK_BREWMASTER, T28, B4 )->effectN( 1 ).percent();
+
     return am;
   }
 
@@ -2547,6 +2548,19 @@ struct keg_smash_t : public monk_melee_attack_t
     // Bonedust Brew
     if ( get_td( s->target )->debuff.bonedust_brew->up() )
       brew_cooldown_reduction( p()->covenant.necrolord->effectN( 3 ).base_value() );
+
+    // Tier 28 4-piece
+    if ( p()->sets->has_set_bonus( MONK_BREWMASTER, T28, B4 ) )
+    {
+      auto heal_amount   = p()->sets->set( MONK_BREWMASTER, T28, B4 )->effectN( 2 ).percent() * s->result_raw;
+      heal->base_dd_min  = heal_amount;
+      heal->base_dd_max  = heal_amount;
+      heal->execute();
+
+      // Set bonus uses the raw values. Meaning if Keg Smash Crits, it uses the pre-crit values.
+      auto hp_gain = p()->sets->set( MONK_BREWMASTER, T28, B4 )->effectN( 3 ).percent() * s->result_raw;
+      p()->buff.keg_of_the_heavens->trigger( 1, hp_gain, 1.0, p()->passives.keg_of_the_heavens_buff->duration() );
+    }
   }
 };
 
@@ -3194,9 +3208,6 @@ struct breath_of_fire_t : public monk_spell_t
 
     if ( p()->legendary.charred_passions->ok() )
       p()->buff.charred_passions->trigger();
-
-    if ( p()->sets->has_set_bonus( MONK_BREWMASTER, T28, B4 ) )
-      p()->buff.flames_of_primordium->trigger();
   }
 
   void impact( action_state_t* s ) override
@@ -5776,7 +5787,7 @@ struct stagger_buff_t : public monk_buff_t<buff_t>
 };
 
 // ===============================================================================
-// Tier 28 Primordial Potential
+// Tier 28 Primordial Potential Buff
 // ===============================================================================
 
 struct primordial_potential_buff_t : public monk_buff_t<buff_t>
@@ -5799,7 +5810,7 @@ struct primordial_potential_buff_t : public monk_buff_t<buff_t>
 };
 
 // ===============================================================================
-// Tier 28 Primordial Power
+// Tier 28 Primordial Power Buff
 // ===============================================================================
 
 struct primordial_power_buff_t : public monk_buff_t<buff_t>
@@ -5809,6 +5820,71 @@ struct primordial_power_buff_t : public monk_buff_t<buff_t>
     add_invalidate( CACHE_PLAYER_DAMAGE_MULTIPLIER );
     set_reverse( true );
     set_reverse_stack_count( s->max_stacks() );
+  }
+};
+
+// ===============================================================================
+// Tier 28 Keg of the Heavens Buff
+// ===============================================================================
+// The way the buff works is that it takes the last 10 Keg Smash amounts and adds
+// them as health to the monk. Once the 11th stack triggers, the first stack is
+// removed and the new stack goes to the end of the list. Once the buff expires
+// the stack is reset.
+
+struct keg_of_the_heavens_buff_t : public monk_buff_t<buff_t>
+{
+  std::deque<double> values;
+  keg_of_the_heavens_buff_t( monk_t& p, util::string_view n, const spell_data_t* s ) : monk_buff_t( p, n, s )
+  {
+    set_can_cancel( true );
+    set_cooldown( timespan_t::zero() );
+  }
+
+  bool trigger( int stacks, double value, double chance, timespan_t duration ) override
+  {
+    if ( at_max_stacks() )
+    {
+      auto amount = values.front();
+      p().sim->print_debug( "First stack of keg_of_the_heavens buff is getting removed. Removing (amount: {}) Health", amount );
+      p().stat_loss( STAT_MAX_HEALTH, amount, (gain_t*)nullptr, (action_t*)nullptr, true );
+      p().stat_loss( STAT_HEALTH, amount, (gain_t*)nullptr, (action_t*)nullptr, true );
+      values.pop_front();
+    }
+
+    p().sim->print_debug( "Keg Smash adds (amount: {}) Health to keg_of_the_heavens buff", value );
+
+    p().stat_gain( STAT_MAX_HEALTH, value, (gain_t*)nullptr, (action_t*)nullptr, true );
+    p().stat_gain( STAT_HEALTH, value, (gain_t*)nullptr, (action_t*)nullptr, true );
+
+    // Make sure the value is reset upon each trigger
+    current_value = 0;
+
+    values.push_back( value );
+
+    return buff_t::trigger( stacks, value, chance, duration );
+  }
+
+  double value() override
+  {
+    double total_value = 0;
+
+    if ( !values.empty() )
+    {
+      for ( auto& i : values )
+        total_value += i;
+    }
+
+    return total_value;
+  }
+
+  void expire_override( int expiration_stacks, timespan_t remaining_duration ) override
+  {
+    auto hp_reset = value();
+    p().sim->print_debug( "keg_of_the_heavens buff is resetting. Reducing Health by (amount: {})", hp_reset );
+    p().stat_loss( STAT_MAX_HEALTH, hp_reset, (gain_t*)nullptr, (action_t*)nullptr, true );
+    p().stat_loss( STAT_HEALTH, hp_reset, (gain_t*)nullptr, (action_t*)nullptr, true );
+    values.clear();
+    buff_t::expire_override( expiration_stacks, remaining_duration );
   }
 };
 }  // namespace buffs
@@ -6624,6 +6700,8 @@ void monk_t::init_spells()
   passives.call_to_arms_empowered_tiger_lightning = find_spell( 360829 );
 
   // Tier 28
+  passives.keg_of_the_heavens_buff    = find_spell( 366794 );
+  passives.keg_of_the_heavens_heal    = find_spell( 366793 );
   passives.primordial_potential       = find_spell( 363911 );
   passives.primordial_power           = find_spell( 363924 );
 
@@ -6995,7 +7073,7 @@ void monk_t::create_buffs()
       make_buff( this, "fae_exposure_heal", passives.fae_exposure_heal )->set_default_value_from_effect( 1 );
 
   // Tier 28 Set Bonus
-  buff.flames_of_primordium = make_buff( this, "flames_of_primordium", find_spell( 364101 ) );
+  buff.keg_of_the_heavens = new buffs::keg_of_the_heavens_buff_t( *this, "keg_of_the_heavens", passives.keg_of_the_heavens_buff );
   buff.primordial_potential =
       new buffs::primordial_potential_buff_t( *this, "primordial_potential", passives.primordial_potential );
   buff.primordial_power = new buffs::primordial_power_buff_t( *this, "primordial_power", passives.primordial_power );
@@ -8013,7 +8091,7 @@ void monk_t::target_mitigation( school_e school, result_amount_type dt, action_s
     s->result_amount *= 1.0 + dmg_reduction;
 
     if ( sets->has_set_bonus( MONK_BREWMASTER, T28, B2 ) )
-      s->result_amount *= 1.0 + sets->set( MONK_BREWMASTER, T28, B2 )->effectN( 1 ).percent();
+      s->result_amount *= 1.0 + sets->set( MONK_BREWMASTER, T28, B2 )->effectN( 1 ).percent(); // Saved as -4%
   }
 
   // Inner Strength
